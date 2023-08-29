@@ -1,0 +1,19 @@
+[tool.poetry]
+name = "rp2040-flashtool"
+version = "0.1.0"
+description = "Tool to communicate with Gigahawk's fork of rp2040-serial-bootloader"
+authors = ["Jasper Chan <jasperchan515@gmail.com>"]
+readme = "README.md"
+
+[tool.poetry.scripts]
+rp2040-flashtool = "rp2040_flashtool.cli:app"
+
+[tool.poetry.dependencies]
+python = "^3.10"
+typer = {extras = ["all"], version = "^0.9.0"}
+pyserial = "^3.5"
+
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"
