@@ -1,4 +1,6 @@
-from time import sleep
+from dataclasses import dataclass
+from pathlib import Path
+from time import sleep, time
 import zlib
 import rp2040_flashtool.type_hints as type_hints
 
@@ -9,13 +11,53 @@ import typer
 app = typer.Typer(context_settings={"help_option_names": ["-h", "--help"]})
 
 baudrate = 115200
-max_data_len = 1024
-# TODO: figure this out later?
-image_size = 1024*1024
 
 def _serial(port: str):
     return Serial(port, baudrate=baudrate, timeout=1, write_timeout=1)
 
+@dataclass
+class BlInfo:
+    flash_start: int
+    flash_size: int
+    erase_start: int
+    erase_size: int
+    write_size: int
+    max_data_len: int
+
+    @property
+    def flash_end(self):
+        return self.flash_start + self.flash_size
+    
+    @property
+    def sector_size(self):
+        return self.erase_size
+
+    @classmethod
+    def from_bytes(cls, data):
+        data_len = 24   
+        if len(data) != data_len:
+            print(f"Error: info response must always be {data_len} bytes long")
+            print(data)
+            exit(1)
+        flash_start = int.from_bytes(data[0:4], "little")
+        flash_size = int.from_bytes(data[4:8], "little")
+        erase_start = int.from_bytes(data[8:12], "little")
+        erase_size = int.from_bytes(data[12:16], "little")
+        write_size = int.from_bytes(data[16:20], "little")
+        max_data_len = int.from_bytes(data[20:24], "little")
+        return cls(
+            flash_start, flash_size, erase_start, 
+            erase_size, write_size, max_data_len)
+
+    def __repr__(self):
+        return (
+            f"Flash start:     {hex(self.flash_start)}\n"
+            f"Flash size:      {hex(self.flash_size)}\n"
+            f"Erase start:     {hex(self.erase_start)}\n"
+            f"Erase size:      {hex(self.erase_size)}\n"
+            f"Write size:      {hex(self.write_size)}\n"
+            f"Max data length: {hex(self.max_data_len)}\n"
+        )
 
 @app.command()
 def sync(port: type_hints.port = None):
@@ -45,20 +87,45 @@ def sync(port: type_hints.port = None):
     print("Could not find an RP2040 in bootloader mode")
     exit(1)
 
-def send_cmd(port: str, cmd: bytes, args: bytes):
+def send_cmd(
+        port: str, 
+        cmd: bytes, 
+        args: bytes = b"", 
+        timeout: float = 1,
+        resp_size: int = 0):
     with _serial(port) as ser:
         ser.write(cmd)
-        sleep(0.1)
-        ser.read_all()
-        ser.write(args)
-        sleep(0.1)
-        resp = ser.read_all()
-        if resp[8:12] != b"OKOK":
+        if args:
+            ser.write(args)
+        cmd_len = len(cmd) + len(args)
+        total_len = cmd_len + 4 + resp_size
+        resp = b""
+        start = time()
+        while time() - start < timeout:
+            resp += ser.read_all()
+            if resp[cmd_len:cmd_len + 4] == b"OKOK" and len(resp) >= total_len:
+                break
+        else:
             print("Error reading response from RP2040")
             print(resp)
             raise ValueError
-        data = resp[12:]
+        data = resp[cmd_len + 4:]
         return data
+
+@app.command()
+def info(port: type_hints.port = None):
+    attempts = 3
+    port = sync(port)
+    print(f"Getting device info from port {port}")
+    for _ in range(attempts):
+        data = send_cmd(port, b"INFO", resp_size=24)
+        bl_info = BlInfo.from_bytes(data)
+        print(bl_info)
+        break
+    else:
+        print(f"Failed to get info from port {port}")
+        exit(1)
+    return port, bl_info
 
 def _read(port: str, addr: int, size: int):
     print(f"Reading {hex(size)} bytes from {hex(addr)}")
@@ -66,13 +133,13 @@ def _read(port: str, addr: int, size: int):
         addr.to_bytes(length=4, byteorder="little") +
         size.to_bytes(length=4, byteorder="little")
     )
-    data = send_cmd(port, b"READ", args)
+    data = send_cmd(port, b"READ", args, resp_size=size)
     if len(data) != size:
         print("RP2040 did not return correct number of bytes")
         print(data)
         raise ValueError
     expected_crc = zlib.crc32(data).to_bytes(length=4, byteorder="little")
-    crc = send_cmd(port, b"CRCC", args)
+    crc = send_cmd(port, b"CRCC", args, resp_size=4)
     if expected_crc != crc:
         print(f"Error: CRC mismatch, expected {expected_crc}, got {crc}")
         raise ValueError
@@ -82,12 +149,14 @@ def _read(port: str, addr: int, size: int):
 def read(
         port: type_hints.port = None,
         out_file: type_hints.out_file = "out.bin",
-        addr: type_hints.addr = 0x10000000,
+        addr: type_hints.addr = None,
         length: type_hints.length = None):
+    port, bl_info = info(port)
+    if addr is None:
+        addr = bl_info.flash_start
     if length is None:
-        length = 0x20000000 - addr
+        length = bl_info.flash_end - addr
     attempts = 3
-    port = sync(port)
     print(f"Downloading image from port {port} to {out_file}")
     print(
         f"Start address: {hex(addr)}\n"
@@ -97,15 +166,112 @@ def read(
     idx = 0
     with open(out_file, "wb") as f:
         while idx < length:
-            read_size = min(max_data_len, length - idx)
+            read_size = min(bl_info.max_data_len, length - idx)
             for _ in range(attempts):
                 try:
                     f.write(_read(port, addr + idx, read_size))
                     break
                 except ValueError:
                     pass
+            else:
+                raise
             idx += read_size
 
+def _erase(port: str, addr: int, size: int):
+    print(f"Erasing {hex(size)} bytes from {hex(addr)}")
+    args = (
+        addr.to_bytes(length=4, byteorder="little") +
+        size.to_bytes(length=4, byteorder="little")
+    )
+    send_cmd(port, b"ERAS", args, timeout=10)
+
+@app.command()
+def erase(
+        port: type_hints.port = None,
+        addr: type_hints.addr = None,
+        length: type_hints.length = None):
+    port, bl_info = info(port)
+    if addr is None:
+        addr = bl_info.erase_start
+    if length is None:
+        length = bl_info.flash_end - addr
+    attempts = 3
+    print(f"Erasing data from port {port}")
+    print(
+        f"Start address: {hex(addr)}\n"
+        f"End address: {hex(addr + length)}\n"
+        f"Length: {hex(length)}"
+    )
+    if addr & (bl_info.sector_size - 1) or length & (bl_info.sector_size - 1):
+        print(f"Address and length must be aligned to 4k")
+        exit(1)
+    idx = 0
+    while idx < length:
+        # TODO: This should work for all values?
+        erase_size = min(0xfffff000, length - idx)
+        for _ in range(attempts):
+            try:
+                _erase(port, addr + idx, erase_size)
+                break
+            except ValueError:
+                pass
+        else:
+            raise
+        idx += erase_size
+
+def _write(port: str, addr: int, data: bytes):
+    size = len(data)
+    print(f"Writing {hex(size)} bytes to {hex(addr)}")
+    args = (
+        addr.to_bytes(length=4, byteorder="little") +
+        size.to_bytes(length=4, byteorder="little") +
+        data
+    )
+    crc = send_cmd(port, b"WRIT", args, timeout=10, resp_size=4)
+    expected_crc = zlib.crc32(data).to_bytes(length=4, byteorder="little")
+    if expected_crc != crc:
+        print(f"Error: CRC mismatch, expected {expected_crc}, got {crc}")
+        raise ValueError
+
+@app.command()
+def write(
+        in_file: type_hints.in_file,
+        port: type_hints.port = None,
+        addr: type_hints.flash_addr = None):
+    attempts = 3
+    port, bl_info = info(port)
+    print(f"Uploading image {in_file} to port {port}")
+    in_file = Path(in_file)
+    if in_file.suffix.lower() == ".elf":
+        print(".elf files are not supported yet")
+        raise NotImplemented
+        # addr, data = load_elf(in_file)
+    elif in_file.suffix.lower() == ".bin":
+        if addr is None:
+            print("Error: base address must be provided for a .bin file")
+            exit(1)
+        with open(in_file, "rb") as f:
+            data = f.read()
+    else:
+        print(f"Unsupported file type {in_file.suffix}")
+    length = len(data)
+    print(
+        f"Start address: {hex(addr)}\n"
+        f"End address: {hex(addr + length)}\n"
+        f"Length: {hex(length)}"
+    )
+    idx = 0
+    while idx < length:
+        write_size = min(bl_info.max_data_len, length - idx)
+        for _ in range(attempts):
+            try:
+                _write(port, addr + idx, data[idx:idx + write_size])
+                break
+            except ValueError:
+                pass
+        else:
+            raise
+        idx += write_size
 
 if __name__ == "__main__":
     app()

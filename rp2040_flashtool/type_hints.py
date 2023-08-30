@@ -38,8 +38,21 @@ out_file = Annotated[
         "--out", "-o",
         help="Name of the output file")]
 
+in_file = Annotated[
+    str, 
+    typer.Option(
+        "--in", "-i",
+        help="Name of the input file")]
+
 addr = Annotated[
     int, 
+    typer.Option(
+        "--addr", "-a",
+        parser=parse_integer,
+        help="Starting address to read/write from")]
+
+flash_addr = Annotated[
+    Optional[int], 
     typer.Option(
         "--addr", "-a",
         parser=parse_integer,
