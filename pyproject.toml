@@ -12,6 +12,7 @@ rp2040-flashtool = "rp2040_flashtool.cli:app"
 python = "^3.10"
 typer = {extras = ["all"], version = "^0.9.0"}
 pyserial = "^3.5"
+pyelftools = "^0.29"
 
 
 [build-system]

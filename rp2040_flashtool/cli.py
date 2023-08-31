@@ -3,6 +3,7 @@ from pathlib import Path
 from time import sleep, time
 import zlib
 import rp2040_flashtool.type_hints as type_hints
+from rp2040_flashtool.util import load_elf, pad_len, BlInfo
 
 from serial import Serial
 from serial.tools.list_ports import comports
@@ -15,49 +16,6 @@ baudrate = 115200
 def _serial(port: str):
     return Serial(port, baudrate=baudrate, timeout=1, write_timeout=1)
 
-@dataclass
-class BlInfo:
-    flash_start: int
-    flash_size: int
-    erase_start: int
-    erase_size: int
-    write_size: int
-    max_data_len: int
-
-    @property
-    def flash_end(self):
-        return self.flash_start + self.flash_size
-    
-    @property
-    def sector_size(self):
-        return self.erase_size
-
-    @classmethod
-    def from_bytes(cls, data):
-        data_len = 24   
-        if len(data) != data_len:
-            print(f"Error: info response must always be {data_len} bytes long")
-            print(data)
-            exit(1)
-        flash_start = int.from_bytes(data[0:4], "little")
-        flash_size = int.from_bytes(data[4:8], "little")
-        erase_start = int.from_bytes(data[8:12], "little")
-        erase_size = int.from_bytes(data[12:16], "little")
-        write_size = int.from_bytes(data[16:20], "little")
-        max_data_len = int.from_bytes(data[20:24], "little")
-        return cls(
-            flash_start, flash_size, erase_start, 
-            erase_size, write_size, max_data_len)
-
-    def __repr__(self):
-        return (
-            f"Flash start:     {hex(self.flash_start)}\n"
-            f"Flash size:      {hex(self.flash_size)}\n"
-            f"Erase start:     {hex(self.erase_start)}\n"
-            f"Erase size:      {hex(self.erase_size)}\n"
-            f"Write size:      {hex(self.write_size)}\n"
-            f"Max data length: {hex(self.max_data_len)}\n"
-        )
 
 @app.command()
 def sync(port: type_hints.port = None):
@@ -243,9 +201,7 @@ def write(
     print(f"Uploading image {in_file} to port {port}")
     in_file = Path(in_file)
     if in_file.suffix.lower() == ".elf":
-        print(".elf files are not supported yet")
-        raise NotImplemented
-        # addr, data = load_elf(in_file)
+        addr, data = load_elf(in_file, bl_info)
     elif in_file.suffix.lower() == ".bin":
         if addr is None:
             print("Error: base address must be provided for a .bin file")
@@ -255,11 +211,22 @@ def write(
     else:
         print(f"Unsupported file type {in_file.suffix}")
     length = len(data)
+    pad_length = pad_len(length, bl_info.write_size)
+    if pad_length:
+        print(f"Need to pad image by {hex(pad_length)}")
+        data += bytes(pad_length)
+        length = len(data)
     print(
         f"Start address: {hex(addr)}\n"
         f"End address: {hex(addr + length)}\n"
         f"Length: {hex(length)}"
     )
+    if addr < bl_info.flash_start:
+        print(f"Error: start address {hex(addr)} is outside the writeable range")
+        exit(1)
+    if addr + length > bl_info.flash_end:
+        print(f"Error: end address {hex(addr + length)} is outside the writeable range")
+        exit(1)
     idx = 0
     while idx < length:
         write_size = min(bl_info.max_data_len, length - idx)
