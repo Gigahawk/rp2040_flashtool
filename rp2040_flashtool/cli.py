@@ -3,9 +3,9 @@ from pathlib import Path
 from time import sleep, time
 import zlib
 import rp2040_flashtool.type_hints as type_hints
-from rp2040_flashtool.util import load_elf, pad_len, BlInfo
+from rp2040_flashtool.util import load_file, pad_len, BlInfo
 
-from serial import Serial
+from serial import Serial, SerialException
 from serial.tools.list_ports import comports
 import typer
 
@@ -15,7 +15,6 @@ baudrate = 115200
 
 def _serial(port: str):
     return Serial(port, baudrate=baudrate, timeout=1, write_timeout=1)
-
 
 @app.command()
 def sync(port: type_hints.port = None):
@@ -147,8 +146,10 @@ def _erase(port: str, addr: int, size: int):
 def erase(
         port: type_hints.port = None,
         addr: type_hints.addr = None,
-        length: type_hints.length = None):
-    port, bl_info = info(port)
+        length: type_hints.length = None,
+        bl_info: type_hints.bl_info = None):
+    if port is None or bl_info is None:
+        port, bl_info = info(port)
     if addr is None:
         addr = bl_info.erase_start
     if length is None:
@@ -195,27 +196,13 @@ def _write(port: str, addr: int, data: bytes):
 def write(
         in_file: type_hints.in_file,
         port: type_hints.port = None,
-        addr: type_hints.flash_addr = None):
-    attempts = 3
-    port, bl_info = info(port)
+        addr: type_hints.flash_addr = None,
+        bl_info: type_hints.bl_info = None):
+    if port is None or bl_info is None:
+        port, bl_info = info(port)
     print(f"Uploading image {in_file} to port {port}")
-    in_file = Path(in_file)
-    if in_file.suffix.lower() == ".elf":
-        addr, data = load_elf(in_file, bl_info)
-    elif in_file.suffix.lower() == ".bin":
-        if addr is None:
-            print("Error: base address must be provided for a .bin file")
-            exit(1)
-        with open(in_file, "rb") as f:
-            data = f.read()
-    else:
-        print(f"Unsupported file type {in_file.suffix}")
+    addr, data = load_file(in_file, bl_info, addr)
     length = len(data)
-    pad_length = pad_len(length, bl_info.write_size)
-    if pad_length:
-        print(f"Need to pad image by {hex(pad_length)}")
-        data += bytes(pad_length)
-        length = len(data)
     print(
         f"Start address: {hex(addr)}\n"
         f"End address: {hex(addr + length)}\n"
@@ -227,6 +214,7 @@ def write(
     if addr + length > bl_info.flash_end:
         print(f"Error: end address {hex(addr + length)} is outside the writeable range")
         exit(1)
+    attempts = 3
     idx = 0
     while idx < length:
         write_size = min(bl_info.max_data_len, length - idx)
@@ -239,6 +227,52 @@ def write(
         else:
             raise
         idx += write_size
+
+def _seal(port: str, addr: int, length: int, crc: bytes):
+    args = (
+        addr.to_bytes(length=4, byteorder="little") +
+        length.to_bytes(length=4, byteorder="little") +
+        crc
+    )
+    send_cmd(port, b"SEAL", args)
+
+@app.command()
+def flash(
+        in_file: type_hints.in_file,
+        port: type_hints.port = None,
+        addr: type_hints.flash_addr = None,
+        should_boot: type_hints.boot = False):
+    port, bl_info = info(port)
+    addr, data = load_file(in_file, bl_info, addr)
+    erase_pad_length = pad_len(len(data), bl_info.erase_size)
+    print(f"Need to pad erase by {hex(erase_pad_length)}")
+    erase(port, addr, len(data) + erase_pad_length, bl_info)
+    write(in_file, port, addr, bl_info)
+    crc = zlib.crc32(data)
+    print(f"Sealing RP2040 with CRC {hex(crc)}")
+    crc = crc.to_bytes(length=4, byteorder="little")
+    _seal(port, addr, len(data), crc)
+    if should_boot:
+        boot(port, addr, bl_info)
+
+def _go(port: str, addr: int):
+    args = addr.to_bytes(length=4, byteorder="little")
+    try:
+        send_cmd(port, b"GOGO", args)
+    except SerialException:
+        # USB serial will disconnect on jump
+        print("RP2040 serial disconnected")
+
+@app.command()
+def boot(
+        port: type_hints.port = None,
+        addr: type_hints.boot_addr = None,
+        bl_info: type_hints.bl_info = None):
+    if port is None or bl_info is None:
+        port, bl_info = info(port)
+    print(f"Jumping to {hex(addr)}")
+    _go(port, addr)
+    
 
 if __name__ == "__main__":
     app()

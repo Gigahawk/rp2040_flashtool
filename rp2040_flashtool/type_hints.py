@@ -1,6 +1,7 @@
-from typing import Optional
+from typing import Optional, Any
 from typing_extensions import Annotated
 import typer
+from rp2040_flashtool.util import BlInfo
 
 def _rename(name):
     def decorator(f):
@@ -49,14 +50,27 @@ addr = Annotated[
     typer.Option(
         "--addr", "-a",
         parser=parse_integer,
-        help="Starting address to read/write from")]
+        help="Starting address to read from")]
 
 flash_addr = Annotated[
     Optional[int], 
     typer.Option(
         "--addr", "-a",
         parser=parse_integer,
-        help="Starting address to read/write from")]
+        help="Starting address to write from")]
+
+boot_addr = Annotated[
+    Optional[int], 
+    typer.Option(
+        "--addr", "-a",
+        parser=parse_integer,
+        help="Address to jump to")]
+
+boot = Annotated[
+    bool, 
+    typer.Option(
+        "--boot", "-b",
+        help="Boot into image after flashing")]
 
 length = Annotated[
     Optional[int], 
@@ -64,3 +78,7 @@ length = Annotated[
         "--len", "-l",
         parser=parse_integer,
         help="Number of bytes to read, full flash range if not specified")]
+
+bl_info = Annotated[
+    Optional[BlInfo], 
+    typer.Option(parser=lambda x: None, hidden=True)]

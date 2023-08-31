@@ -1,3 +1,4 @@
+from pathlib import Path
 from dataclasses import dataclass
 from elftools.elf.elffile import ELFFile
 
@@ -102,6 +103,26 @@ def load_elf(file: str, bl_info: BlInfo):
 def pad_len(length, align):
     next_aligned = ((length + align - 1) // align) * align
     return next_aligned - length
+
+def load_file(file: str, bl_info: BlInfo, addr: int = None):
+    file = Path(file)
+    if file.suffix.lower() == ".elf":
+        addr, data = load_elf(file, bl_info)
+    elif file.suffix.lower() == ".bin":
+        if addr is None:
+            print("Error: base address must be provided for a .bin file")
+            exit(1)
+        with open(file, "rb") as f:
+            data = f.read()
+    else:
+        print(f"Unsupported file type {file.suffix}")
+        exit(1)
+    length = len(data)
+    pad_length = pad_len(length, bl_info.write_size)
+    if pad_length:
+        print(f"Need to pad image by {hex(pad_length)}")
+        data += bytes(pad_length)
+    return addr, data
 
 
 
